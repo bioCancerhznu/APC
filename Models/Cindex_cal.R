@@ -1,0 +1,460 @@
+#=======================================================
+
+
+#=======================================================
+
+rm(list=ls())
+library(survival)         
+library(Hmisc)            
+library(dplyr)            
+library(tidyverse)        
+library(CoxBoost)         
+library(randomForestSRC)  
+library(gbm)               
+library(caret)            
+library(survivalsvm)     
+library(glmnet)
+library(superpc)
+library(pheatmap)
+library(timeROC)       
+library(survivalROC)
+
+
+#=======================================================
+
+#=======================================================
+
+train_data <- read.csv("traindata.csv", header = TRUE, row.names = 1)
+test_data <- read.csv("testdata.csv", header = TRUE, row.names = 1)
+
+#=======================================================
+
+#=======================================================
+
+model_names <- c("SRF_100", "SRF_500", "CoxPH", "CoxGB_100", "CoxGB_500", 
+                 "GBM_100", "GBM_500", "sCox", "LASSO", "Ridge", 
+                 "ENet_0.1", "ENet_0.5", "ENet_0.9")
+
+# Create dataframe to store the scores
+scores_df <- data.frame(matrix(NA, nrow = nrow(test_data), ncol = length(model_names)))
+colnames(scores_df) <- model_names
+
+#=======================================================
+# RandomForestSRC with 100 trees and 500 trees
+#=======================================================
+set.seed(1234)
+
+# rfSRC with 100 trees
+model_RF_100 <- rfsrc(Surv(OSTime, OS) ~ ., data = train_data, ntree = 100)
+scores_df[, "SRF_100"] <- predict(model_RF_100, test_data)$predicted
+
+# rfSRC with 500 trees
+model_RF_500 <- rfsrc(Surv(OSTime, OS) ~ ., data = train_data, ntree = 500)
+scores_df[, "SRF_500"] <- predict(model_RF_500, test_data)$predicted
+
+#=======================================================
+# CoxPH (No hyperparameters to tune, just use default)
+#=======================================================
+fit_cox <- coxph(Surv(OSTime, OS) ~ ., data = train_data)
+scores_df[, "CoxPH"] <- as.numeric(predict(fit_cox, newdata = test_data, type = "lp"))
+
+#=======================================================
+# CoxBoost with 100 and 200 boosting steps
+#=======================================================
+fit_CoxBoost_100 <- CoxBoost(time = train_data$OSTime, status = train_data$OS, x = as.matrix(train_data[, -c(1, 2)]), stepno = 100)
+scores_df[, "CoxGB_100"] <- as.numeric(predict(fit_CoxBoost_100, newdata = as.matrix(test_data[, -c(1, 2)]), type = "lp"))
+
+fit_CoxBoost_500 <- CoxBoost(time = train_data$OSTime, status = train_data$OS, x = as.matrix(train_data[, -c(1, 2)]), stepno = 500)
+scores_df[, "CoxGB_500"] <- as.numeric(predict(fit_CoxBoost_500, newdata = as.matrix(test_data[, -c(1, 2)]), type = "lp"))
+
+#=======================================================
+# GBM with 100 and 500 trees
+#=======================================================
+fit_gbm_100 <- gbm(Surv(OSTime, OS) ~ ., data = train_data, distribution = 'coxph', n.trees = 100)
+scores_df[, "GBM_100"] <- predict(fit_gbm_100, newdata = test_data, type = "link", n.trees = 100)
+
+fit_gbm_500 <- gbm(Surv(OSTime, OS) ~ ., data = train_data, distribution = 'coxph', n.trees = 500)
+scores_df[, "GBM_500"] <- predict(fit_gbm_500, newdata = test_data, type = "link", n.trees = 500)
+
+#=======================================================
+# Stepwise CoxPH (No hyperparameters to tune, just use default)
+#=======================================================
+full_cox_model <- coxph(Surv(OSTime, OS) ~ ., data = train_data)
+step_cox_model <- step(full_cox_model, direction = "both", trace = FALSE)
+scores_df[, "sCox"] <- as.numeric(predict(step_cox_model, newdata = test_data, type = "lp"))
+
+#=======================================================
+# Lasso, Ridge, and Elastic Net (Cross-validated lambda)
+#=======================================================
+x_train <- model.matrix(Surv(OSTime, OS) ~ ., data = train_data)[, -1]
+y_train <- Surv(train_data$OSTime, train_data$OS)
+x_test <- model.matrix(Surv(OSTime, OS) ~ ., data = test_data)[, -1]
+
+# Lasso (alpha = 1)
+fit_lasso <- cv.glmnet(x_train, y_train, family = "cox", alpha = 1)
+scores_df[, "LASSO"] <- as.numeric(predict(fit_lasso, newx = x_test, s = "lambda.min", type = "link"))
+
+# Ridge (alpha = 0)
+fit_ridge <- cv.glmnet(x_train, y_train, family = "cox", alpha = 0)
+scores_df[, "Ridge"] <- as.numeric(predict(fit_ridge, newx = x_test, s = "lambda.min", type = "link"))
+
+# Elastic Net with alpha = 0.1
+fit_enet_0.1 <- cv.glmnet(x_train, y_train, family = "cox", alpha = 0.1)
+scores_df[, "ENet_0.1"] <- as.numeric(predict(fit_enet_0.1, newx = x_test, s = "lambda.min", type = "link"))
+
+# Elastic Net with alpha = 0.5
+fit_enet_0.5 <- cv.glmnet(x_train, y_train, family = "cox", alpha = 0.5)
+scores_df[, "ENet_0.5"] <- as.numeric(predict(fit_enet_0.5, newx = x_test, s = "lambda.min", type = "link"))
+
+# Elastic Net with alpha = 0.9
+fit_enet_0.9 <- cv.glmnet(x_train, y_train, family = "cox", alpha = 0.9)
+scores_df[, "ENet_0.9"] <- as.numeric(predict(fit_enet_0.9, newx = x_test, s = "lambda.min", type = "link"))
+
+#=======================================================
+
+#=======================================================
+
+scores_df <- as.data.frame(scale(scores_df))
+rownames(scores_df) <- rownames(test_data)
+
+column_names <- names(scores_df)
+
+for (i in 1:(length(column_names) - 1)) {
+  for (j in (i + 1):length(column_names)) {
+    new_column_name <- paste(column_names[i], column_names[j], sep="_plus_")
+    scores_df[[new_column_name]] <- scores_df[[column_names[i]]] + scores_df[[column_names[j]]]
+  }
+}
+
+scores_df$OSTime <- test_data$OSTime
+scores_df$OS <- test_data$OS
+
+#=======================================================
+
+#=======================================================
+
+column_names <- names(scores_df)
+filtered_column_names <- column_names[!column_names %in% c("OS", "OSTime")]
+
+
+model_c_indices <- numeric(length(filtered_column_names))
+
+for (i in 1:length(filtered_column_names)) {
+  model_name <- filtered_column_names[i]
+  surv_obj <- Surv(scores_df$OSTime, scores_df$OS)
+  
+  risk_scores <- scores_df[, model_name]
+  
+  c_index <- rcorr.cens(risk_scores, surv_obj)
+  c_index_value <- as.numeric(c_index["C Index"])
+  c_index_value <- 1 - c_index_value
+  model_c_indices[i] <- c_index_value
+
+  print(i)
+}
+
+c_index_df <- data.frame(Model = filtered_column_names, C_index = model_c_indices)
+
+write.csv(c_index_df, file = "Cindex_test.csv")
+
+c_index_df
+
+
+#=======================================================
+
+
+
+
+
+#=======================================================
+
+
+
+
+
+
+#=======================================================
+
+
+
+rm(list=ls())
+
+
+selected_data <- read.csv("traindata.csv", header = T, row.names = 1)
+
+set.seed(1234) 
+random_order <- sample(nrow(selected_data)) 
+shuffled_data <- selected_data[random_order, ]
+print(shuffled_data[1:4, 1:4])
+selected_data <- shuffled_data
+
+
+K <- 5
+
+model_names <-  c("SRF_100", "SRF_500", "CoxPH", "CoxGB_100", "CoxGB_500", 
+                  "GBM_100", "GBM_500", "sCox", "LASSO", "Ridge", 
+                  "ENet_0.1", "ENet_0.5", "ENet_0.9")
+
+#=======================================================
+
+#=======================================================
+
+c_index_list <- list()
+
+for (fold in 1:K) {
+  
+  print(fold)
+  fold_size <- nrow(selected_data) / K
+  test_indices <- ((fold - 1) * fold_size + 1):(fold * fold_size)
+  train_indices <- setdiff(1:nrow(selected_data), test_indices)
+  train_data <- selected_data[train_indices, ]
+  test_data <- selected_data[test_indices, ]
+  
+  
+  #RF
+  model_RF_100 <- rfsrc(Surv(OSTime, OS) ~ ., data = train_data, ntree = 100)
+  risk_scores_RF_100 <- predict(model_RF_100, test_data)$predicted
+  model_RF_500 <- rfsrc(Surv(OSTime, OS) ~ ., data = train_data, ntree = 500)
+  risk_scores_RF_500 <- predict(model_RF_500, test_data)$predicted
+  print("rf model construction completed")
+  current_time <- Sys.time()
+  formatted_time <- format(current_time, "%Y-%m-%d %H:%M:%S")
+  print(formatted_time)
+  
+  
+  
+  # Cox
+  fit_cox <- coxph(Surv(OSTime, OS) ~ ., data = train_data)
+  risk_scores_cox <- predict(fit_cox, newdata = test_data[, -c(1, 2)], type = "lp")
+  risk_scores_cox <- as.numeric(risk_scores_cox)
+  print("cox model construction completed")
+  current_time <- Sys.time()
+  formatted_time <- format(current_time, "%Y-%m-%d %H:%M:%S")
+  print(formatted_time)
+  
+  
+  
+  # CoxBoost
+  fit_CoxBoost_100 <- CoxBoost(train_data[, 'OSTime'], train_data[, 'OS'], as.matrix(train_data[, -c(1, 2)]),
+                               stepno = 100)
+  risk_scores_CoxBoost_100 <- predict(fit_CoxBoost_100, newdata = test_data[, -c(1, 2)], type = "lp")
+  risk_scores_CoxBoost_100 <- as.numeric(risk_scores_CoxBoost_100)
+  fit_CoxBoost_500 <- CoxBoost(train_data[, 'OSTime'], train_data[, 'OS'], as.matrix(train_data[, -c(1, 2)]),
+                               stepno = 500)
+  risk_scores_CoxBoost_500 <- predict(fit_CoxBoost_500, newdata = test_data[, -c(1, 2)], type = "lp")
+  risk_scores_CoxBoost_500 <- as.numeric(risk_scores_CoxBoost_500)
+  print("CoxBoost model construction completed")
+  current_time <- Sys.time()
+  formatted_time <- format(current_time, "%Y-%m-%d %H:%M:%S")
+  print(formatted_time)
+  
+  
+  
+  # GBM
+  fit_gbm_100 <- gbm(formula = Surv(OSTime, OS) ~ ., data = train_data, distribution = 'coxph')
+  risk_scores_gbm_100 <- predict(fit_gbm_100, newdata = test_data)
+  fit_gbm_500 <- gbm(formula = Surv(OSTime, OS) ~ ., data = train_data, distribution = 'coxph')
+  risk_scores_gbm_500 <- predict(fit_gbm_500, newdata = test_data)
+  print("gbm model construction completed")
+  current_time <- Sys.time()
+  formatted_time <- format(current_time, "%Y-%m-%d %H:%M:%S")
+  print(formatted_time)
+  
+  
+  
+  
+  # Stepwise Cox
+  full_cox_model <- coxph(Surv(OSTime, OS) ~ ., data = train_data)
+  step_cox_model <- step(full_cox_model, direction = "both", trace = FALSE)
+  risk_scores_stepcox <- predict(step_cox_model, newdata = test_data[, -c(1, 2)], type = "lp")
+  risk_scores_stepcox <- as.numeric(risk_scores_stepcox)
+  print("stepwise Cox model construction completed")
+  current_time <- Sys.time()
+  formatted_time <- format(current_time, "%Y-%m-%d %H:%M:%S")
+  print(formatted_time)
+  
+  # Lasso
+  x_train <- model.matrix(Surv(OSTime, OS) ~ ., data = train_data)[, -1]
+  y_train <- Surv(train_data$OSTime, train_data$OS)
+  x_test <- model.matrix(Surv(OSTime, OS) ~ ., data = test_data)[, -1]
+  
+  fit_lasso <- cv.glmnet(x_train, y_train, family = "cox", alpha = 1)
+  risk_scores_lasso <- predict(fit_lasso, newx = x_test, s = "lambda.min", type = "link")
+  risk_scores_lasso <- as.numeric(risk_scores_lasso)
+  print("lasso model construction completed")
+  current_time <- Sys.time()
+  formatted_time <- format(current_time, "%Y-%m-%d %H:%M:%S")
+  print(formatted_time)
+  
+  # Ridge
+  fit_ridge <- cv.glmnet(x_train, y_train, family = "cox", alpha = 0)
+  risk_scores_ridge <- predict(fit_ridge, newx = x_test, s = "lambda.min", type = "link")
+  risk_scores_ridge <- as.numeric(risk_scores_ridge)
+  print("ridge model construction completed")
+  current_time <- Sys.time()
+  formatted_time <- format(current_time, "%Y-%m-%d %H:%M:%S")
+  print(formatted_time)
+  
+  
+  
+  
+  # Elastic Net 
+  fit_enet_0.1 <- cv.glmnet(x_train, y_train, family = "cox", alpha = 0.1)
+  risk_scores_enet_0.1 <- predict(fit_enet_0.1, newx = x_test, s = "lambda.min", type = "link")
+  risk_scores_enet_0.1 <- as.numeric(risk_scores_enet_0.1)
+  
+  fit_enet_0.5 <- cv.glmnet(x_train, y_train, family = "cox", alpha = 0.5)
+  risk_scores_enet_0.5 <- predict(fit_enet_0.5, newx = x_test, s = "lambda.min", type = "link")
+  risk_scores_enet_0.5 <- as.numeric(risk_scores_enet_0.5)
+  
+  fit_enet_0.9 <- cv.glmnet(x_train, y_train, family = "cox", alpha = 0.9)
+  risk_scores_enet_0.9 <- predict(fit_enet_0.9, newx = x_test, s = "lambda.min", type = "link")
+  risk_scores_enet_0.9 <- as.numeric(risk_scores_enet_0.9)
+  
+  
+  
+  print("Elastic Net model construction completed")
+  current_time <- Sys.time()
+  formatted_time <- format(current_time, "%Y-%m-%d %H:%M:%S")
+  print(formatted_time)
+  
+
+  scores_df <- data.frame(matrix(NA, nrow = nrow(test_data), ncol = length(model_names)))
+  colnames(scores_df) <- model_names
+  
+  scores_df[, "SRF_100"] <- risk_scores_RF_100
+  scores_df[, "SRF_500"] <- risk_scores_RF_500
+  scores_df[, "CoxPH"] <- risk_scores_cox
+  scores_df[, "CoxGB_100"] <- risk_scores_CoxBoost_100
+  scores_df[, "CoxGB_500"] <- risk_scores_CoxBoost_500
+  
+  scores_df[, "GBM_100"] <- risk_scores_gbm_100
+  scores_df[, "GBM_500"] <- risk_scores_gbm_500
+  scores_df[, "sCox"] <- risk_scores_stepcox
+  scores_df[, "LASSO"] <- risk_scores_lasso
+  scores_df[, "Ridge"] <- risk_scores_ridge
+  
+  scores_df[, "ENet_0.1"] <- risk_scores_enet_0.1
+  scores_df[, "ENet_0.5"] <- risk_scores_enet_0.5
+  scores_df[, "ENet_0.9"] <- risk_scores_enet_0.9
+  
+  #=======================================================
+  
+  #=======================================================
+  
+  scores_df <- as.data.frame(scale(scores_df))
+  rownames(scores_df) <- rownames(test_data)
+  
+
+  column_names <- names(scores_df)
+  
+
+  for (i in 1:(length(column_names) - 1)) {
+    for (j in (i + 1):length(column_names)) {
+      new_column_name <- paste(column_names[i], column_names[j], sep="|")
+      scores_df[[new_column_name]] <- scores_df[[column_names[i]]] + scores_df[[column_names[j]]]
+    }
+  }
+  
+  
+  scores_df$OSTime <- test_data$OSTime
+  scores_df$OS <- test_data$OS
+  
+  
+  
+  column_names <- names(scores_df)
+  filtered_column_names <- column_names[!column_names %in% c("OS", "OSTime")]
+  
+  #=======================================================
+  
+  #=======================================================
+  
+  
+  model_c_indices <- numeric(length(filtered_column_names))
+  
+  for (i in 1:length(filtered_column_names)) {
+    model_name <- filtered_column_names[i]
+    risk_scores <- scores_df[, model_name]
+    surv_obj <- Surv(scores_df$OSTime, scores_df$OS)
+    c_index <- rcorr.cens(risk_scores, surv_obj)
+    c_index_value <- as.numeric(c_index["C Index"])
+    c_index_value <- 1 - c_index_value
+    model_c_indices[i] <- c_index_value
+    print(i)
+    print(c_index_value)
+  }
+  
+  c_index_df <- data.frame(Model = filtered_column_names, C_index = model_c_indices)
+
+  c_index_list[[fold]] <- c_index_df
+  
+}
+
+c_index_list
+
+
+#=======================================================
+
+#=======================================================
+
+c_index_columns <- lapply(c_index_list, function(df) df$C_index)
+model_names <- c_index_list[[1]]$Model
+combined_c_index_df <- data.frame(Model = model_names)
+combined_c_index_df <- cbind(combined_c_index_df, do.call(cbind, c_index_columns))
+print(combined_c_index_df)
+
+
+
+colnames(combined_c_index_df) <- paste0('ValidationSet', colnames(combined_c_index_df))
+
+
+testResult <- read.csv("Cindex_test.csv", header = T, row.names = 1)
+rownames(testResult) == rownames(combined_c_index_df)
+combined_c_index_df$testingSet <- testResult$C_index
+rownames(combined_c_index_df) <- combined_c_index_df$ValidationSetModel
+combined_c_index_df$ValidationSetModel <- NULL
+combined_c_index_df$meanValue <- rowMeans(combined_c_index_df, na.rm = TRUE)
+combined_c_index_df <- combined_c_index_df %>%
+  dplyr::arrange(desc(meanValue))
+
+head(combined_c_index_df)
+
+
+#=======================================================
+
+#=======================================================
+
+
+minVt <- min(combined_c_index_df)
+maxVt <- max(combined_c_index_df)
+
+colors <- colorRampPalette(c("#F6F5F2", "#B1C381"))(50)
+
+breaks <- seq(minVt, maxVt , length.out=50) 
+
+
+p <- pheatmap(as.matrix(combined_c_index_df), 
+              scale="none",
+              display_numbers=TRUE,
+              color=colors,
+              breaks=breaks,
+              cluster_rows=FALSE, 
+              cluster_cols=FALSE, 
+              width=8, 
+              height=6, 
+              main="C-index value",
+              legend = FALSE,
+              fontsize=7,  
+              border_color=NA,  
+              number_color = "black", 
+              angle_col=45,
+              number_format = "%.3f",
+              na_col="gray") 
+
+print(p)
+
+pdf(file = "c_index.pdf", height = 12, width = 8)
+print(p)
+dev.off()
+
+
